@@ -38,6 +38,30 @@ Migrate GitHub Issues to Fizzy Cards - a command-line tool that transfers issues
    yum install jq      # RHEL/CentOS
    ```
 
+### Optional Tools
+
+4. **cmark** or **pandoc** - Markdown to HTML conversion
+
+   GitHub issues use Markdown formatting. For proper rendering in Fizzy, install one of these converters:
+
+   ```bash
+   # cmark (recommended - lightweight)
+   # macOS
+   brew install cmark
+
+   # Linux
+   apt-get install cmark  # Debian/Ubuntu
+
+   # OR pandoc (full-featured)
+   # macOS
+   brew install pandoc
+
+   # Linux
+   apt-get install pandoc
+   ```
+
+   If neither is installed, content will be migrated as plain text (Markdown syntax visible but not rendered).
+
 ### Environment Variables (Optional)
 
 ```bash
