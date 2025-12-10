@@ -1,0 +1,634 @@
+#!/usr/bin/env bash
+#
+# gh2fizzy - Migrate GitHub Issues to Fizzy Cards
+#
+# Usage: gh2fizzy --board BOARD_ID [options]
+#
+# See gh2fizzy --help for full documentation.
+#
+
+set -euo pipefail
+
+# Script version
+VERSION="1.0.0"
+
+# Default values
+REPO=""
+STATE="open"
+LABELS=()
+ASSIGNEE=""
+MILESTONE=""
+LIMIT=100
+ISSUES=()
+
+FIZZY_ACCOUNT_ID="${FIZZY_ACCOUNT:-}"
+BOARD_ID=""
+COLUMN_ID=""
+
+DRY_RUN=false
+VERBOSE=false
+QUIET=false
+CLOSE_ISSUES=false
+ADD_MIGRATED_LABEL=false
+
+# Counters for summary
+TOTAL_ISSUES=0
+SUCCESS_COUNT=0
+FAIL_COUNT=0
+
+# Color output helpers (disabled if not a terminal)
+if [[ -t 1 ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    BLUE='\033[0;34m'
+    NC='\033[0m' # No Color
+else
+    RED=''
+    GREEN=''
+    YELLOW=''
+    BLUE=''
+    NC=''
+fi
+
+log_info() {
+    [[ "$QUIET" == "true" ]] && return
+    echo -e "${BLUE}[INFO]${NC} $*" >&2
+}
+
+log_success() {
+    [[ "$QUIET" == "true" ]] && return
+    echo -e "${GREEN}[SUCCESS]${NC} $*" >&2
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $*" >&2
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $*" >&2
+}
+
+log_verbose() {
+    [[ "$VERBOSE" == "true" ]] && echo -e "${BLUE}[DEBUG]${NC} $*" >&2
+}
+
+die() {
+    log_error "$1"
+    exit "${2:-1}"
+}
+
+show_help() {
+    cat << 'EOF'
+gh2fizzy - Migrate GitHub Issues to Fizzy Cards
+
+USAGE:
+    gh2fizzy --board BOARD_ID [OPTIONS]
+
+REQUIRED:
+    --board BOARD_ID        Fizzy board ID to create cards in
+
+GITHUB FILTERS:
+    -R, --repo OWNER/REPO   GitHub repository (default: current repo)
+    --state STATE           Issue state: open, closed, all (default: open)
+    -l, --label LABEL       Filter by label (can be repeated)
+    --assignee USERNAME     Filter by assignee
+    --milestone TITLE       Filter by milestone
+    --limit N               Maximum issues to migrate (default: 100)
+    -i, --issue NUMBER      Specific issue number (can be repeated)
+
+FIZZY OPTIONS:
+    --account ACCOUNT_ID    Fizzy account ID (default: $FIZZY_ACCOUNT)
+    --column COLUMN_ID      Place cards in specific column (default: triage)
+
+BEHAVIOR:
+    --dry-run               Preview without making changes
+    -v, --verbose           Show detailed output
+    -q, --quiet             Suppress non-error output
+    --close-issues          Close GitHub issues after migration
+    --add-migrated-label    Add "migrated-to-fizzy" label to issues
+
+OTHER:
+    -h, --help              Show this help message
+    --version               Show version
+
+EXAMPLES:
+    # Migrate all open issues to a board
+    gh2fizzy --board 12345
+
+    # Migrate specific issues
+    gh2fizzy --board 12345 -i 42 -i 43
+
+    # Migrate from specific repo with filters
+    gh2fizzy -R owner/repo -l bug --state open --board 12345
+
+    # Preview what would be migrated
+    gh2fizzy --board 12345 --dry-run
+
+    # Migrate and mark as migrated in GitHub
+    gh2fizzy --board 12345 --close-issues --add-migrated-label
+EOF
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            --version)
+                echo "gh2fizzy version $VERSION"
+                exit 0
+                ;;
+            -R|--repo)
+                REPO="$2"
+                shift 2
+                ;;
+            --state)
+                STATE="$2"
+                shift 2
+                ;;
+            -l|--label)
+                LABELS+=("$2")
+                shift 2
+                ;;
+            --assignee)
+                ASSIGNEE="$2"
+                shift 2
+                ;;
+            --milestone)
+                MILESTONE="$2"
+                shift 2
+                ;;
+            --limit)
+                LIMIT="$2"
+                shift 2
+                ;;
+            -i|--issue)
+                ISSUES+=("$2")
+                shift 2
+                ;;
+            --account)
+                FIZZY_ACCOUNT_ID="$2"
+                shift 2
+                ;;
+            --board)
+                BOARD_ID="$2"
+                shift 2
+                ;;
+            --column)
+                COLUMN_ID="$2"
+                shift 2
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -q|--quiet)
+                QUIET=true
+                shift
+                ;;
+            --close-issues)
+                CLOSE_ISSUES=true
+                shift
+                ;;
+            --add-migrated-label)
+                ADD_MIGRATED_LABEL=true
+                shift
+                ;;
+            *)
+                die "Unknown argument: $1\nRun 'gh2fizzy --help' for usage." 2
+                ;;
+        esac
+    done
+}
+
+validate_args() {
+    if [[ -z "$BOARD_ID" ]]; then
+        die "Missing required argument: --board BOARD_ID\nRun 'gh2fizzy --help' for usage." 2
+    fi
+
+    # Validate state
+    if [[ ! "$STATE" =~ ^(open|closed|all)$ ]]; then
+        die "Invalid --state value: $STATE. Must be: open, closed, or all" 2
+    fi
+
+    # Validate limit is a number
+    if ! [[ "$LIMIT" =~ ^[0-9]+$ ]]; then
+        die "Invalid --limit value: $LIMIT. Must be a positive integer" 2
+    fi
+
+    log_verbose "Arguments validated"
+}
+
+check_dependencies() {
+    log_verbose "Checking dependencies..."
+
+    local missing=()
+
+    if ! command -v gh &>/dev/null; then
+        missing+=("gh (GitHub CLI)")
+    fi
+
+    if ! command -v fizzy &>/dev/null; then
+        missing+=("fizzy (Fizzy CLI)")
+    fi
+
+    if ! command -v jq &>/dev/null; then
+        missing+=("jq (JSON processor)")
+    fi
+
+    # Check for markdown converter (optional but recommended)
+    if ! command -v cmark &>/dev/null && ! command -v pandoc &>/dev/null; then
+        log_warn "No markdown converter found (cmark or pandoc). Markdown will not be converted to HTML."
+        MARKDOWN_CONVERTER=""
+    elif command -v cmark &>/dev/null; then
+        MARKDOWN_CONVERTER="cmark"
+    else
+        MARKDOWN_CONVERTER="pandoc"
+    fi
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_error "Missing required tools:"
+        for tool in "${missing[@]}"; do
+            echo "  - $tool"
+        done
+        exit 3
+    fi
+
+    log_verbose "All dependencies found"
+}
+
+check_auth() {
+    log_verbose "Checking authentication..."
+
+    # Check GitHub auth
+    if ! gh auth status &>/dev/null; then
+        die "GitHub CLI not authenticated. Run: gh auth login" 4
+    fi
+
+    # Check Fizzy auth
+    if ! fizzy identity show --quiet &>/dev/null; then
+        die "Fizzy CLI not authenticated. Run: fizzy auth login YOUR_TOKEN" 4
+    fi
+
+    log_verbose "Authentication verified"
+}
+
+# Convert markdown to HTML if converter is available
+markdown_to_html() {
+    local markdown="$1"
+
+    if [[ -z "$MARKDOWN_CONVERTER" ]]; then
+        # No converter, return as-is
+        echo "$markdown"
+        return
+    fi
+
+    if [[ "$MARKDOWN_CONVERTER" == "cmark" ]]; then
+        echo "$markdown" | cmark --unsafe 2>/dev/null || echo "$markdown"
+    else
+        echo "$markdown" | pandoc -f gfm -t html 2>/dev/null || echo "$markdown"
+    fi
+}
+
+build_gh_command() {
+    local cmd="gh issue list"
+
+    # Add repo if specified
+    if [[ -n "$REPO" ]]; then
+        cmd+=" --repo $REPO"
+    fi
+
+    # Add state filter
+    cmd+=" --state $STATE"
+
+    # Add label filters
+    for label in "${LABELS[@]}"; do
+        cmd+=" --label \"$label\""
+    done
+
+    # Add assignee
+    if [[ -n "$ASSIGNEE" ]]; then
+        cmd+=" --assignee $ASSIGNEE"
+    fi
+
+    # Add milestone
+    if [[ -n "$MILESTONE" ]]; then
+        cmd+=" --milestone \"$MILESTONE\""
+    fi
+
+    # Add limit
+    cmd+=" --limit $LIMIT"
+
+    # JSON output with all needed fields
+    cmd+=" --json number,title,body,comments,author,createdAt,labels"
+
+    echo "$cmd"
+}
+
+fetch_issues() {
+    log_info "Fetching issues from GitHub..."
+
+    local issues_json
+
+    # If specific issues requested, fetch them individually
+    if [[ ${#ISSUES[@]} -gt 0 ]]; then
+        log_verbose "Fetching ${#ISSUES[@]} specific issue(s)..."
+        issues_json="["
+        local first=true
+        for issue_num in "${ISSUES[@]}"; do
+            local repo_flag=""
+            [[ -n "$REPO" ]] && repo_flag="--repo $REPO"
+
+            local issue_data
+            issue_data=$(gh issue view "$issue_num" $repo_flag --json number,title,body,comments,author,createdAt,labels 2>/dev/null) || true
+
+            if [[ -n "$issue_data" ]]; then
+                [[ "$first" == "false" ]] && issues_json+=","
+                issues_json+="$issue_data"
+                first=false
+            else
+                log_warn "Issue #$issue_num not found, skipping"
+            fi
+        done
+        issues_json+="]"
+    else
+        # Fetch based on filters
+        local cmd
+        cmd=$(build_gh_command)
+        log_verbose "Running: $cmd"
+
+        issues_json=$(eval "$cmd" 2>/dev/null) || die "Failed to fetch issues from GitHub"
+    fi
+
+    # Return the JSON
+    echo "$issues_json"
+}
+
+format_comments() {
+    local comments_json="$1"
+    local comment_count
+    comment_count=$(echo "$comments_json" | jq 'length')
+
+    if [[ "$comment_count" == "0" ]]; then
+        echo ""
+        return
+    fi
+
+    local formatted="**Migrated Comments from GitHub Issues**\n\n"
+
+    # Process each comment
+    local i=0
+    while [[ $i -lt $comment_count ]]; do
+        local author body created_at
+        author=$(echo "$comments_json" | jq -r ".[$i].author.login // \"unknown\"")
+        body=$(echo "$comments_json" | jq -r ".[$i].body // \"\"")
+        created_at=$(echo "$comments_json" | jq -r ".[$i].createdAt // \"\"")
+
+        # Format the date nicely
+        local formatted_date="$created_at"
+        if [[ -n "$created_at" ]]; then
+            # Convert ISO date to readable format
+            formatted_date=$(date -d "$created_at" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "$created_at")
+        fi
+
+        formatted+="---\n"
+        formatted+="**@${author}** commented on ${formatted_date}:\n\n"
+        formatted+="${body}\n\n"
+
+        i=$((i + 1))
+    done
+
+    echo -e "$formatted"
+}
+
+create_fizzy_card() {
+    local title="$1"
+    local body="$2"
+    local labels_json="$3"
+    local comments_json="$4"
+    local issue_number="$5"
+
+    log_verbose "Creating card for issue #$issue_number: $title"
+
+    # Build fizzy options
+    local fizzy_opts=""
+    [[ -n "$FIZZY_ACCOUNT_ID" ]] && fizzy_opts+=" --account $FIZZY_ACCOUNT_ID"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY-RUN] Would create card: $title"
+        log_verbose "[DRY-RUN] Description length: ${#body} chars"
+
+        # Show labels that would be applied
+        local label_count
+        label_count=$(echo "$labels_json" | jq 'length')
+        if [[ "$label_count" -gt 0 ]]; then
+            local label_names
+            label_names=$(echo "$labels_json" | jq -r '.[].name' | tr '\n' ', ' | sed 's/,$//')
+            log_verbose "[DRY-RUN] Would apply tags: $label_names"
+        fi
+
+        # Show comment count
+        local comment_count
+        comment_count=$(echo "$comments_json" | jq 'length')
+        if [[ "$comment_count" -gt 0 ]]; then
+            log_verbose "[DRY-RUN] Would add $comment_count migrated comment(s)"
+        fi
+
+        return 0
+    fi
+
+    # Convert markdown to HTML and create temp file for description
+    local desc_file html_body
+    desc_file=$(mktemp)
+    html_body=$(markdown_to_html "$body")
+    echo "$html_body" > "$desc_file"
+
+    # Create the card
+    local response
+    response=$(fizzy card create \
+        $fizzy_opts \
+        --board "$BOARD_ID" \
+        --title "$title" \
+        --description_file "$desc_file" \
+        --format json 2>&1) || true
+
+    rm -f "$desc_file"
+
+    # Parse response
+    local success card_number
+    success=$(echo "$response" | jq -r '.success // false' 2>/dev/null) || success="false"
+
+    if [[ "$success" != "true" ]]; then
+        local error_msg
+        error_msg=$(echo "$response" | jq -r '.error.message // "Unknown error"' 2>/dev/null) || error_msg="$response"
+        log_error "Failed to create card for issue #$issue_number: $error_msg"
+        return 1
+    fi
+
+    # Try to get card number from response, or fetch most recent card
+    card_number=$(echo "$response" | jq -r '.data.number // empty' 2>/dev/null)
+
+    if [[ -z "$card_number" || "$card_number" == "null" ]]; then
+        # fizzy card create doesn't return card data, fetch most recent card by title match
+        log_verbose "Fetching card number for newly created card..."
+        local cards_response
+        cards_response=$(fizzy card list --board "$BOARD_ID" $fizzy_opts --format json 2>/dev/null) || true
+        card_number=$(echo "$cards_response" | jq -r --arg title "$title" '.data[] | select(.title == $title) | .number' 2>/dev/null | head -1)
+    fi
+
+    if [[ -z "$card_number" || "$card_number" == "null" ]]; then
+        log_success "Created card for issue #$issue_number (card number unavailable)"
+        log_warn "Unable to retrieve card number - skipping tags and comments"
+        return 0
+    fi
+
+    log_success "Created card #$card_number for issue #$issue_number"
+
+    # Move to column if specified
+    if [[ -n "$COLUMN_ID" ]]; then
+        log_verbose "Moving card #$card_number to column $COLUMN_ID"
+        fizzy card column "$card_number" --column "$COLUMN_ID" $fizzy_opts --quiet >/dev/null 2>&1 || \
+            log_warn "Failed to move card to column"
+    fi
+
+    # Apply tags from labels
+    local label_count
+    label_count=$(echo "$labels_json" | jq 'length')
+    if [[ "$label_count" -gt 0 ]]; then
+        log_verbose "Applying $label_count tag(s) from labels..."
+        local j=0
+        while [[ $j -lt $label_count ]]; do
+            local label_name
+            label_name=$(echo "$labels_json" | jq -r ".[$j].name")
+            fizzy card tag "$card_number" --tag "$label_name" $fizzy_opts --quiet >/dev/null 2>&1 || \
+                log_warn "Failed to apply tag: $label_name"
+            j=$((j + 1))
+        done
+    fi
+
+    # Add migrated comments
+    local formatted_comments
+    formatted_comments=$(format_comments "$comments_json")
+    if [[ -n "$formatted_comments" ]]; then
+        log_verbose "Adding migrated comments to card #$card_number"
+
+        # Convert comments markdown to HTML
+        local comment_file html_comments
+        comment_file=$(mktemp)
+        html_comments=$(markdown_to_html "$formatted_comments")
+        echo "$html_comments" > "$comment_file"
+
+        fizzy comment create \
+            --card "$card_number" \
+            --body_file "$comment_file" \
+            $fizzy_opts --quiet >/dev/null 2>&1 || \
+            log_warn "Failed to add comments to card"
+
+        rm -f "$comment_file"
+    fi
+}
+
+post_migration_github() {
+    local issue_number="$1"
+    local repo_flag=""
+    [[ -n "$REPO" ]] && repo_flag="--repo $REPO"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        [[ "$CLOSE_ISSUES" == "true" ]] && log_info "[DRY-RUN] Would close issue #$issue_number"
+        [[ "$ADD_MIGRATED_LABEL" == "true" ]] && log_info "[DRY-RUN] Would add 'migrated-to-fizzy' label to #$issue_number"
+        return 0
+    fi
+
+    if [[ "$ADD_MIGRATED_LABEL" == "true" ]]; then
+        log_verbose "Adding 'migrated-to-fizzy' label to issue #$issue_number"
+        gh issue edit "$issue_number" $repo_flag --add-label "migrated-to-fizzy" 2>/dev/null || \
+            log_warn "Failed to add label to issue #$issue_number"
+    fi
+
+    if [[ "$CLOSE_ISSUES" == "true" ]]; then
+        log_verbose "Closing issue #$issue_number"
+        gh issue close "$issue_number" $repo_flag 2>/dev/null || \
+            log_warn "Failed to close issue #$issue_number"
+    fi
+}
+
+print_summary() {
+    echo ""
+    echo "============================================"
+    echo "Migration Summary"
+    echo "============================================"
+    echo "Total issues processed: $TOTAL_ISSUES"
+    echo "Successfully migrated:  $SUCCESS_COUNT"
+    echo "Failed:                 $FAIL_COUNT"
+    echo "============================================"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo ""
+        echo "This was a DRY RUN - no changes were made."
+    fi
+}
+
+main() {
+    parse_args "$@"
+    validate_args
+    check_dependencies
+    check_auth
+
+    log_info "Starting GitHub to Fizzy migration"
+    [[ "$DRY_RUN" == "true" ]] && log_warn "DRY RUN MODE - no changes will be made"
+
+    # Fetch issues
+    local issues_json
+    issues_json=$(fetch_issues)
+
+    TOTAL_ISSUES=$(echo "$issues_json" | jq 'length')
+
+    if [[ "$TOTAL_ISSUES" == "0" ]]; then
+        log_warn "No issues found matching the criteria"
+        exit 0
+    fi
+
+    log_info "Found $TOTAL_ISSUES issue(s) to migrate"
+
+    # Process each issue
+    local i=0
+    while [[ $i -lt $TOTAL_ISSUES ]]; do
+        local issue
+        issue=$(echo "$issues_json" | jq ".[$i]")
+
+        local number title body labels_json comments_json
+        number=$(echo "$issue" | jq -r '.number')
+        title=$(echo "$issue" | jq -r '.title')
+        body=$(echo "$issue" | jq -r '.body // ""')
+        labels_json=$(echo "$issue" | jq '.labels // []')
+        comments_json=$(echo "$issue" | jq '.comments // []')
+
+        log_info "Processing issue #$number ($((i+1))/$TOTAL_ISSUES)"
+
+        if create_fizzy_card "$title" "$body" "$labels_json" "$comments_json" "$number"; then
+            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+            post_migration_github "$number"
+        else
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+        fi
+
+        i=$((i + 1))
+    done
+
+    print_summary
+
+    # Exit with partial failure code if any failed
+    if [[ $FAIL_COUNT -gt 0 ]]; then
+        exit 5
+    fi
+}
+
+# Run main with all arguments
+main "$@"
