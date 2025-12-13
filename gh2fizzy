@@ -309,9 +309,11 @@ build_gh_command() {
     cmd+=" --state $STATE"
 
     # Add label filters
-    for label in "${LABELS[@]}"; do
-        cmd+=" --label \"$label\""
-    done
+    if [[ ${#LABELS[@]} -gt 0 ]]; then
+        for label in "${LABELS[@]}"; do
+            cmd+=" --label \"$label\""
+        done
+    fi
 
     # Add assignee
     if [[ -n "$ASSIGNEE" ]]; then
